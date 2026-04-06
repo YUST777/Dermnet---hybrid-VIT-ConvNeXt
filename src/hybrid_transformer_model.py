@@ -1,6 +1,6 @@
 # ============================================================
-# 2025/2026 SOTA Hybrid Transformer Model for DermNet
-# Architecture: Hugging Face Vision Transformer (ViT) + ConvNeXt
+# Team Member: Yousef (Project Lead)
+# Component: Core AI Architecture (Hybrid ViT + ConvNeXt)
 # ============================================================
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
