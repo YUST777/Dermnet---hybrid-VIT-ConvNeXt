@@ -4,20 +4,13 @@
 # ============================================================
 import os
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
-os.environ["TF_CUDNN_USE_AUTOTUNE"] = "0"
-os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import numpy as np
 import tensorflow as tf
-
-# Fix "No DNN in stream executor" cuDNN workspace OOM crashes
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
     except RuntimeError as e:
         print(e)
+        
+# FORCE DISABLE NVIDIA TENSOR CORES (TF32) TO BYPASS CUDNN SHAPE MISMATCHES
+tf.config.experimental.enable_tensor_float_32_execution(False)
         
 from tensorflow.keras.applications import ConvNeXtBase
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization, Concatenate, Input, Permute
@@ -119,15 +112,70 @@ if __name__ == '__main__':
     train_gen, test_gen = get_data_generators()
     num_classes = len(train_gen.class_indices)
     
-    model, conv_base, vit_base = build_hybrid_transformer(num_classes)
+    # We detach the architecture into two distinct frozen brains
+    inputs = Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     
-    # Compute severe class weights for the 23-disease imbalance
-    classes = train_gen.classes
+    conv_base = ConvNeXtBase(weights='imagenet', include_top=False, input_tensor=inputs)
+    conv_features = GlobalAveragePooling2D()(conv_base.output)
+    model_conv = Model(inputs, conv_features)
+    
+    from vit_keras import vit
+    vit_base = vit.vit_b16(image_size=IMG_SIZE, activation='linear', pretrained=True, include_top=False, pretrained_top=False)
+    vit_features = vit_base(inputs)
+    model_vit = Model(inputs, vit_features)
+    
+    print("\n=== PHASE 1: EXACT FEATURE EXTRACTION (Bypassing CuDNN Backprop Bug) ===")
+    import math
+    def extract_features(generator, samples):
+        all_conv = []
+        all_vit = []
+        all_labels = []
+        batches = math.ceil(samples / BATCH_SIZE)
+        
+        for i in range(batches):
+            x_batch, y_batch = next(generator)
+            c_feat = model_conv.predict(x_batch, verbose=0)
+            v_feat = model_vit.predict(x_batch, verbose=0)
+            all_conv.append(c_feat)
+            all_vit.append(v_feat)
+            all_labels.append(y_batch)
+            if i % 50 == 0:
+                print(f"Extracted {i}/{batches} batches...")
+                
+        return np.concatenate(all_conv), np.concatenate(all_vit), np.concatenate(all_labels)
+
+    print("Extracting Train Features...")
+    train_conv, train_vit, train_labels = extract_features(train_gen, train_gen.samples)
+    print("Extracting Test Features...")
+    test_conv, test_vit, test_labels = extract_features(test_gen, test_gen.samples)
+    
+    # Merge Features natively on CPU!
+    X_train = np.concatenate([train_conv, train_vit], axis=1)
+    X_test = np.concatenate([test_conv, test_vit], axis=1)
+    
+    # Compute sever class weights
+    classes = np.argmax(train_labels, axis=1)
     class_weights = class_weight.compute_class_weight('balanced', classes=np.unique(classes), y=classes)
     class_weight_dict = {i: w for i, w in enumerate(class_weights)}
-    
+
+    print("\n=== PHASE 2: TRAINING HYBRID HEAD ===")
+    from tensorflow.keras.models import Sequential
     from tensorflow.keras.callbacks import CSVLogger
     
+    # Build Top Classifier
+    top_model = Sequential([
+        BatchNormalization(input_shape=(X_train.shape[1],)),
+        Dense(1024, activation='relu', kernel_regularizer=l2(0.001)),
+        Dropout(0.5),
+        Dense(512, activation='relu', kernel_regularizer=l2(0.001)),
+        Dropout(0.4),
+        Dense(num_classes, activation='softmax')
+    ])
+    
+    top_model.compile(optimizer=Adamax(learning_rate=0.001), 
+                      loss='categorical_crossentropy', 
+                      metrics=['accuracy'])
+                      
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3),
@@ -135,25 +183,10 @@ if __name__ == '__main__':
         CSVLogger('../training_history.csv', append=True)
     ]
     
-    print("\n=== PHASE 1: Training Transformer Head (All 23 Classes) ===")
-    model.fit(train_gen, 
-              validation_data=test_gen, 
-              epochs=15, 
-              callbacks=callbacks, 
-              class_weight=class_weight_dict)
+    top_model.fit(X_train, train_labels,
+                  validation_data=(X_test, test_labels),
+                  epochs=30, batch_size=32,
+                  callbacks=callbacks,
+                  class_weight=class_weight_dict)
     
-    print("\n=== PHASE 2: Unfreezing for Fine-Tuning ===")
-    # Unfreeze top layers of ConvNeXt (we keep ViT frozen as it's massive and overfits easily if unfreezed on small medical data)
-    for layer in conv_base.layers[-30:]: layer.trainable = True
-    
-    model.compile(optimizer=Adamax(learning_rate=0.0001),
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy'])
-                  
-    model.fit(train_gen, 
-              validation_data=test_gen, 
-              epochs=15, 
-              callbacks=callbacks, 
-              class_weight=class_weight_dict)
-    
-    print("\nBleeding Edge Training Complete! Model saved as final_hybrid_transformer.keras")
+    print("\nBleeding Edge Training Complete! Head saved as final_hybrid_transformer.keras")
